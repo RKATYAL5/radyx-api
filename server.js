@@ -43,6 +43,8 @@ loadEnvFile(path.join(__dirname, '.env'));
 const PORT = Number(process.env.PORT || 8787);
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_PATH = path.join(DATA_DIR, 'careers-db.json');
+const RESUME_DIR = path.join(DATA_DIR, 'resumes');
+const MAX_RESUME_BYTES = 5 * 1024 * 1024; // 5MB
 const HR_EMAIL = process.env.HR_EMAIL || 'HR@radyx.ca';
 const ADMIN_EMAIL = process.env.CAREERS_ADMIN_EMAIL || 'hr-admin@radyx.ca';
 const ADMIN_PASSWORD = process.env.CAREERS_ADMIN_PASSWORD || 'ChangeMeNow!';
@@ -122,6 +124,7 @@ const statusStages = [
 
 async function ensureDb() {
   await mkdir(DATA_DIR, { recursive: true });
+  await mkdir(RESUME_DIR, { recursive: true });
   if (!existsSync(DB_PATH)) {
     await writeFile(DB_PATH, JSON.stringify(defaultDb, null, 2), 'utf8');
   }
@@ -212,7 +215,51 @@ function logEmailFailures(context, results) {
   });
 }
 
-async function sendEmail({ to, subject, html, text }) {
+// Branded HTML email wrapper. Table-based layout with inline styles since
+// email clients don't reliably support flexbox/grid or external stylesheets.
+const BRAND_NAME = 'RADYX';
+const BRAND_PRIMARY = '#ec6f27';
+const BRAND_DARK = '#5a3c2b';
+const BRAND_LOGO_URL = 'https://radyx.ca/radyx-logo-email.png';
+const BRAND_SITE_URL = 'https://radyx.ca';
+
+function buildEmailHtml({ heading, bodyHtml, ctaText, ctaUrl }) {
+  return `<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background-color:#f4f1ec;font-family:Helvetica,Arial,sans-serif;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f1ec;padding:32px 16px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 18px rgba(0,0,0,0.06);">
+            <tr>
+              <td style="background-color:#ffffff;padding:24px 32px;border-bottom:3px solid ${BRAND_PRIMARY};">
+                <img src="${BRAND_LOGO_URL}" alt="${BRAND_NAME}" height="32" style="display:block;height:32px;width:auto;" />
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:36px 32px 12px 32px;">
+                <h1 style="margin:0 0 16px 0;font-size:22px;line-height:1.3;color:#1a1a1a;">${heading}</h1>
+                <div style="font-size:15px;line-height:1.6;color:#3f3f3f;">${bodyHtml}</div>
+                ${ctaText && ctaUrl ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:24px;"><tr><td style="border-radius:999px;background-color:${BRAND_PRIMARY};"><a href="${ctaUrl}" style="display:inline-block;padding:12px 28px;font-size:14px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:999px;">${ctaText}</a></td></tr></table>` : ''}
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px 32px 32px 32px;border-top:1px solid #eee2d6;">
+                <p style="margin:0;font-size:12px;line-height:1.6;color:#9a9a9a;">
+                  ${BRAND_NAME} &middot; <a href="${BRAND_SITE_URL}" style="color:#9a9a9a;">${BRAND_SITE_URL.replace('https://', '')}</a><br />
+                  This is an automated message - please don't reply directly to this email.
+                </p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
+}
+
+async function sendEmail({ to, subject, html, text, attachments }) {
   if (EMAIL_PROVIDER === 'resend') {
     const response = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -226,6 +273,7 @@ async function sendEmail({ to, subject, html, text }) {
         subject,
         html,
         text,
+        attachments: attachments?.map((a) => ({ filename: a.filename, content: a.content })),
       }),
     });
 
@@ -245,6 +293,7 @@ async function sendEmail({ to, subject, html, text }) {
       subject,
       html,
       text,
+      attachments: attachments?.map((a) => ({ filename: a.filename, content: a.content, encoding: 'base64' })),
     });
     return { delivered: true, provider: 'smtp' };
   }
@@ -264,11 +313,23 @@ async function notifyHr(application) {
     `Resume: ${application.resume?.fileName || 'Not provided'}`,
   ].join('\n');
 
+  const attachments = [];
+  if (application.resume?.storedFileName) {
+    try {
+      const filePath = path.join(RESUME_DIR, application.resume.storedFileName);
+      const fileBuffer = await readFile(filePath);
+      attachments.push({ filename: application.resume.fileName, content: fileBuffer.toString('base64') });
+    } catch (error) {
+      console.error('[email] Failed to attach resume:', error.message);
+    }
+  }
+
   return sendEmail({
     to: HR_EMAIL,
     subject: `New RADYX application: ${application.roleLabel}`,
     text: `${summary}\n\nMessage:\n${application.message}`,
     html: `<pre>${summary}\n\nMessage:\n${application.message}</pre>`,
+    attachments,
   });
 }
 
@@ -277,7 +338,14 @@ async function notifyApplicant(application) {
     to: application.applicantEmail,
     subject: `RADYX application received: ${application.applicationNumber}`,
     text: `Thank you for applying to ${application.roleLabel}. Your current status is "${application.status}". Tracking number: ${application.applicationNumber}.`,
-    html: `<p>Thank you for applying to <strong>${application.roleLabel}</strong>.</p><p>Your current status is <strong>${application.status}</strong>.</p><p>Tracking number: <strong>${application.applicationNumber}</strong>.</p>`,
+    html: buildEmailHtml({
+      heading: 'Application received',
+      bodyHtml: `<p>Thank you for applying to <strong>${application.roleLabel}</strong> at RADYX.</p>
+        <p>Your current status is <strong>${application.status}</strong>.</p>
+        <p>Tracking number: <strong>${application.applicationNumber}</strong> - keep this for reference.</p>`,
+      ctaText: 'Track your application',
+      ctaUrl: `${BRAND_SITE_URL}/careers`,
+    }),
   });
 }
 
@@ -286,7 +354,14 @@ async function notifyStatusChange(application) {
     to: application.applicantEmail,
     subject: `RADYX application update: ${application.applicationNumber}`,
     text: `Your RADYX application status is now "${application.status}". Next update: ${application.nextStep}`,
-    html: `<p>Your RADYX application status is now <strong>${application.status}</strong>.</p><p>${application.nextStep}</p>`,
+    html: buildEmailHtml({
+      heading: 'Your application status has changed',
+      bodyHtml: `<p>Your application <strong>${application.applicationNumber}</strong> for <strong>${application.roleLabel}</strong> is now:</p>
+        <p style="font-size:18px;font-weight:600;color:${BRAND_PRIMARY};margin:8px 0 16px 0;">${application.status}</p>
+        <p>${application.nextStep || ''}</p>`,
+      ctaText: 'View your application',
+      ctaUrl: `${BRAND_SITE_URL}/careers`,
+    }),
   });
 }
 
@@ -295,7 +370,12 @@ async function sendApplicantCode({ email, code, mode }) {
     to: email,
     subject: `RADYX ${mode === 'signup' ? 'account' : 'sign-in'} code`,
     text: `Your RADYX verification code is ${code}. It expires in 10 minutes.`,
-    html: `<p>Your RADYX verification code is <strong>${code}</strong>.</p><p>It expires in 10 minutes.</p>`,
+    html: buildEmailHtml({
+      heading: mode === 'signup' ? 'Confirm your new account' : 'Confirm it\u2019s you',
+      bodyHtml: `<p>Use this code to ${mode === 'signup' ? 'finish creating your account' : 'sign in'}:</p>
+        <p style="font-size:32px;font-weight:700;letter-spacing:6px;color:${BRAND_DARK};margin:20px 0;">${code}</p>
+        <p style="color:#8a8a8a;font-size:13px;">This code expires in 10 minutes. If you didn't request this, you can safely ignore this email.</p>`,
+    }),
   });
 }
 
@@ -318,7 +398,11 @@ async function sendContactNotification({ name, email, phone, subject, message })
       to: email,
       subject: 'We received your message - RADYX',
       text: `Thanks for reaching out to RADYX. We received your message and will get back to you shortly.\n\nYour message:\n${message}`,
-      html: `<p>Thanks for reaching out to RADYX. We received your message and will get back to you shortly.</p><p><strong>Your message:</strong></p><p>${message}</p>`,
+      html: buildEmailHtml({
+        heading: 'We received your message',
+        bodyHtml: `<p>Thanks for reaching out to RADYX. A member of our team will get back to you shortly.</p>
+          <p style="margin-top:20px;padding:16px;background-color:#f4f1ec;border-radius:8px;color:#5a5a5a;font-size:14px;">${message}</p>`,
+      }),
     }),
   ]);
 
@@ -345,7 +429,14 @@ async function sendHackathonEnrollmentNotification(fields) {
           to: fields.email,
           subject: 'Hackathon enrollment received - RADYX',
           text: `Thanks for enrolling in the RADYX Monthly Hackathon. We received your enrollment for ${fields.eventDate || 'the upcoming event'}.`,
-          html: `<p>Thanks for enrolling in the RADYX Monthly Hackathon.</p><p>We received your enrollment for <strong>${fields.eventDate || 'the upcoming event'}</strong>.</p>`,
+          html: buildEmailHtml({
+            heading: "You're enrolled!",
+            bodyHtml: `<p>Thanks for enrolling in the RADYX Monthly Hackathon.</p>
+              <p>We received your enrollment for <strong>${fields.eventDate || 'the upcoming event'}</strong>.</p>
+              <p>We'll be in touch with event details closer to the date.</p>`,
+            ctaText: 'View hackathon details',
+            ctaUrl: `${BRAND_SITE_URL}/hackathon`,
+          }),
         })
       : Promise.resolve({ delivered: false }),
   ]);
@@ -557,9 +648,38 @@ const server = createServer(async (req, res) => {
       }
 
       const body = await parseBody(req);
+      const applicationId = crypto.randomUUID();
+
+      // If the resume was sent as base64 file data, save it to disk and keep
+      // only metadata (+ the stored filename) in the JSON database - this
+      // keeps the DB itself small and lets us stream the file back on demand.
+      let resumeMeta = body.resume || null;
+      if (body.resume?.fileData) {
+        try {
+          const buffer = Buffer.from(body.resume.fileData, 'base64');
+          if (buffer.length > MAX_RESUME_BYTES) {
+            json(res, 400, { message: 'Resume file is too large (5MB max).' });
+            return;
+          }
+          const extension = path.extname(body.resume.fileName || '') || '';
+          const storedFileName = `${applicationId}${extension}`;
+          await writeFile(path.join(RESUME_DIR, storedFileName), buffer);
+          resumeMeta = {
+            fileName: body.resume.fileName,
+            sizeLabel: body.resume.sizeLabel,
+            mimeType: body.resume.mimeType,
+            storageMode: 'stored',
+            storedFileName,
+          };
+        } catch (error) {
+          console.error('[careers] Failed to store resume:', error.message);
+        }
+      }
+
       const application = {
         ...body,
-        id: crypto.randomUUID(),
+        resume: resumeMeta,
+        id: applicationId,
         applicationNumber: buildApplicationNumber(db),
         applicantEmail: applicant.email,
         applicantName: applicant.fullName,
@@ -575,6 +695,41 @@ const server = createServer(async (req, res) => {
       await Promise.allSettled([notifyHr(application), notifyApplicant(application)]);
 
       json(res, 201, { application });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/careers/applications/') && url.pathname.endsWith('/resume')) {
+      const applicationId = url.pathname.split('/')[3];
+      const token = getAuthToken(req) || url.searchParams.get('token') || '';
+      const db = await readDb();
+      const application = db.applications.find((entry) => entry.id === applicationId);
+
+      if (!application || !application.resume?.storedFileName) {
+        json(res, 404, { message: 'Resume not found.' });
+        return;
+      }
+
+      // Either the applicant who owns this application, or an HR admin, can download it.
+      const isOwner = db.applicants.some(
+        (entry) => entry.sessionToken === token && entry.email === application.applicantEmail
+      );
+      const isAdmin = adminSessions.get(token) === ADMIN_EMAIL;
+      if (!isOwner && !isAdmin) {
+        json(res, 403, { message: 'Not authorized to view this resume.' });
+        return;
+      }
+
+      try {
+        const fileBuffer = await readFile(path.join(RESUME_DIR, application.resume.storedFileName));
+        res.writeHead(200, {
+          'Content-Type': application.resume.mimeType || 'application/octet-stream',
+          'Content-Disposition': `attachment; filename="${application.resume.fileName}"`,
+          'Access-Control-Allow-Origin': req.headers.origin || APP_ORIGIN,
+        });
+        res.end(fileBuffer);
+      } catch {
+        json(res, 404, { message: 'Resume file is missing on the server.' });
+      }
       return;
     }
 
