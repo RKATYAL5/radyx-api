@@ -109,6 +109,8 @@ const EMAIL_PROVIDER = RESEND_API_KEY && RESEND_FROM ? 'resend' : SMTP_HOST && S
 const defaultDb = {
   applicants: [],
   applications: [],
+  trainingUsers: [],
+  trainingProgress: [],
   counters: {
     application: 1000,
   },
@@ -379,6 +381,22 @@ async function sendApplicantCode({ email, code, mode }) {
   });
 }
 
+async function sendTrainingCode({ email, code, mode }) {
+  return sendEmail({
+    to: email,
+    subject: `RADYX Training ${mode === 'signup' ? 'account' : 'sign-in'} code`,
+    text: `Your RADYX Training verification code is ${code}. It expires in 10 minutes.`,
+    html: buildEmailHtml({
+      heading: mode === 'signup' ? 'Welcome to RADYX Training' : 'Confirm it\u2019s you',
+      bodyHtml: `<p>Use this code to ${mode === 'signup' ? 'finish creating your training account' : 'sign in'}:</p>
+        <p style="font-size:32px;font-weight:700;letter-spacing:6px;color:${BRAND_DARK};margin:20px 0;">${code}</p>
+        <p style="color:#8a8a8a;font-size:13px;">This code expires in 10 minutes. If you didn't request this, you can safely ignore this email.</p>`,
+      ctaText: 'Continue training',
+      ctaUrl: `${BRAND_SITE_URL}/training`,
+    }),
+  });
+}
+
 async function sendContactNotification({ name, email, phone, subject, message }) {
   const summary = [
     `Name: ${name}`,
@@ -613,6 +631,162 @@ const server = createServer(async (req, res) => {
       }
 
       json(res, 200, { user: normalizeApplicant(applicant) });
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/training/auth/request-code') {
+      const body = await parseBody(req);
+      const db = await readDb();
+      const email = String(body.email || '').trim().toLowerCase();
+      const mode = body.mode === 'signin' ? 'signin' : 'signup';
+      const fullName = String(body.fullName || '').trim();
+
+      if (!email) {
+        json(res, 400, { message: 'Email is required.' });
+        return;
+      }
+
+      let user = db.trainingUsers.find((entry) => entry.email === email);
+
+      if (mode === 'signup') {
+        if (!fullName) {
+          json(res, 400, { message: 'Full name is required to create a training account.' });
+          return;
+        }
+        if (user) {
+          json(res, 409, { message: 'A training account already exists for this email.' });
+          return;
+        }
+        user = {
+          id: crypto.randomUUID(),
+          fullName,
+          email,
+          createdAt: new Date().toISOString(),
+          sessionToken: null,
+        };
+        db.trainingUsers.push(user);
+      } else if (!user) {
+        json(res, 404, { message: 'No training account exists for this email yet.' });
+        return;
+      }
+
+      const code = createLoginCode();
+      user.loginCodeHash = hashCode(code);
+      user.loginCodeExpiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      await writeDb(db);
+
+      const emailResult = await sendTrainingCode({ email, code, mode });
+
+      json(res, 200, {
+        message: 'Verification code created.',
+        emailDelivered: emailResult.delivered,
+        devCode: emailResult.delivered ? null : code,
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/training/auth/verify-code') {
+      const body = await parseBody(req);
+      const db = await readDb();
+      const email = String(body.email || '').trim().toLowerCase();
+      const code = String(body.code || '').trim();
+      const user = db.trainingUsers.find((entry) => entry.email === email);
+
+      if (!user) {
+        json(res, 404, { message: 'No training account exists for this email.' });
+        return;
+      }
+      if (!code || !user.loginCodeHash || !user.loginCodeExpiresAt) {
+        json(res, 400, { message: 'A valid verification code is required.' });
+        return;
+      }
+      if (new Date(user.loginCodeExpiresAt).getTime() < Date.now()) {
+        json(res, 401, { message: 'That verification code has expired. Please request a new one.' });
+        return;
+      }
+      if (user.loginCodeHash !== hashCode(code)) {
+        json(res, 401, { message: 'That verification code is incorrect.' });
+        return;
+      }
+
+      user.sessionToken = createToken();
+      user.loginCodeHash = null;
+      user.loginCodeExpiresAt = null;
+      await writeDb(db);
+
+      json(res, 200, {
+        user: normalizeApplicant(user),
+        token: user.sessionToken,
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/training/session') {
+      const token = getAuthToken(req);
+      const db = await readDb();
+      const user = db.trainingUsers.find((entry) => entry.sessionToken === token);
+
+      if (!user) {
+        json(res, 404, { message: 'No active training session found.' });
+        return;
+      }
+      json(res, 200, { user: normalizeApplicant(user) });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/training/progress') {
+      const token = getAuthToken(req);
+      const db = await readDb();
+      const user = db.trainingUsers.find((entry) => entry.sessionToken === token);
+
+      if (!user) {
+        json(res, 401, { message: 'Training session required.' });
+        return;
+      }
+
+      const entries = db.trainingProgress.filter((entry) => entry.userId === user.id);
+      json(res, 200, { progress: entries });
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/training/progress') {
+      const token = getAuthToken(req);
+      const db = await readDb();
+      const user = db.trainingUsers.find((entry) => entry.sessionToken === token);
+
+      if (!user) {
+        json(res, 401, { message: 'Training session required.' });
+        return;
+      }
+
+      const body = await parseBody(req);
+      const videoId = String(body.videoId || '').trim();
+      const topicId = String(body.topicId || '').trim();
+      const completed = Boolean(body.completed);
+
+      if (!videoId || !topicId) {
+        json(res, 400, { message: 'videoId and topicId are required.' });
+        return;
+      }
+
+      let entry = db.trainingProgress.find((e) => e.userId === user.id && e.videoId === videoId);
+      if (entry) {
+        entry.completed = completed;
+        entry.updatedAt = new Date().toISOString();
+      } else {
+        entry = {
+          id: crypto.randomUUID(),
+          userId: user.id,
+          topicId,
+          videoId,
+          completed,
+          updatedAt: new Date().toISOString(),
+        };
+        db.trainingProgress.push(entry);
+      }
+      await writeDb(db);
+
+      json(res, 200, { progress: entry });
       return;
     }
 
